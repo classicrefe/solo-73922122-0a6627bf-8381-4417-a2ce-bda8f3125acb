@@ -1,114 +1,125 @@
 {% extends "base.html" %}
-{% block title %}型号 {{ model.name }} · 契约管理{% endblock %}
+{% block title %}型号 {{ model.name }} · 盘片退役管理{% endblock %}
 {% block content %}
-<h1>型号 <span class="tag">{{ model.name }}</span></h1>
-<p class="muted">固件格式只追加；程序格式按程序号替换。发布即触发全量兼容检查（z3 证明，非抽样），失败不改动任何已发布格式。</p>
+<h1>设备型号：{{ model.name }}</h1>
+<p><a href="/">← 返回型号列表</a></p>
 
-{% if result %}
-  {% if result.ok %}
-  <div class="card notice-ok"><h3>✔ 发布成功</h3>{{ result.message }}</div>
-  {% else %}
-  <div class="card notice-bad">
-    <h3>✘ 发布被拒绝</h3>
-    <p>{{ result.message }}</p>
-    {% if result.problems %}
-      <p><b>拒绝依据（不兼容组合与反例报文）：</b></p>
-      {% for p in result.problems %}
-      <div class="card cex">
-        固件写入格式 <b>v{{ p.firmware_version }}</b> 允许的报文被程序
-        <b>「{{ p.program_id }}」</b>拒收，反例报文：
-        <pre>{{ p.counterexample | tojson }}</pre>
-      </div>
-      {% endfor %}
-    {% endif %}
+{% if notice %}
+<div class="card {{ 'notice-ok' if notice.ok else 'notice-bad' }}">
+  <h3>{{ '操作成功' if notice.ok else '操作未生效' }}</h3>
+  <p>{{ notice.message }}</p>
+  {% if notice.missing %}
+  <p>待迁走的报文（在所选范围之外的在用盘上找不到相同测次与摘要的副本）：</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>测次编号</th><th>SHA-256 摘要</th><th>当前所在盘</th></tr></thead>
+    <tbody>
+    {% for m in notice.missing %}
+      <tr>
+        <td class="mono">{{ m.test_no }}</td>
+        <td class="mono">{{ m.sha256 }}</td>
+        <td class="mono">{{ m.on_disk | join(', ') }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
   </div>
+  <p class="muted">整次退役均未生效，所有盘仍为在用状态。请先把上述报文复制到其他在用盘并补登新盘清单，再重新办理。</p>
   {% endif %}
+</div>
 {% endif %}
 
-<div class="cols">
-  <div>
-    <h2>历代固件写入格式（{{ firmwares | length }} / {{ max_formats }}，只追加）</h2>
-    {% for f in firmwares %}
-    <div class="card">
-      <b>v{{ f.version }}</b> <span class="muted">{{ f.created_at }}</span>
-      <pre>{{ f.doc | tojson }}</pre>
-    </div>
-    {% else %}<p class="muted">尚未登记固件格式。</p>{% endfor %}
-  </div>
-  <div>
-    <h2>现用程序读取格式（{{ programs | length }} / {{ max_formats }}，按程序号替换）</h2>
-    {% for p in programs %}
-    <div class="card">
-      <b>{{ p.program_id }}</b> <span class="muted">{{ p.updated_at }}</span>
-      <pre>{{ p.doc | tojson }}</pre>
-    </div>
-    {% else %}<p class="muted">尚未登记程序格式。</p>{% endfor %}
-  </div>
-</div>
-
-<h2>发布新格式</h2>
-<div class="cols">
-  <div class="card">
-    <h3 style="margin-top:0">追加固件写入格式（v{{ (firmwares | length) + 1 }}）</h3>
-    <form method="post" action="/models/{{ model.name }}/firmware">
-      <textarea id="fw_schema" name="schema_text" placeholder='{"type":"object","properties":{...},"required":[...],"additionalProperties":false}'></textarea>
-      <button type="submit">校验并发布固件格式</button>
-    </form>
-  </div>
-  <div class="card">
-    <h3 style="margin-top:0">发布 / 替换程序读取格式</h3>
-    <form method="post" action="/models/{{ model.name }}/programs">
-      <p>程序号：<input type="text" id="prog_id" name="program_id" required
-         pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" placeholder="如 analyzer"></p>
-      <textarea id="prog_schema" name="schema_text" placeholder='{"type":"object","properties":{...},"required":[...],"additionalProperties":false}'></textarea>
-      <button type="submit">校验并发布程序格式</button>
-    </form>
-  </div>
-</div>
-
-<h2>示例（点击填入编辑器）</h2>
-{% for ex in examples %}
 <div class="card">
-  <b>{{ ex.title }}</b>
-  <p class="muted">{{ ex.story }}</p>
-  <p class="muted">操作步骤：{{ ex.steps | join(" → ") }}</p>
-  {% for s in ex.snippets %}
-  <button type="button" class="btn-sm" onclick="fillSnippet(this)"
-          data-target="{{ s.target }}" data-prog="{{ s.program_id or '' }}"
-          data-doc='{{ s.doc | tojsonc }}'>填入：{{ s.label }}</button>
-  {% endfor %}
+  <h2 style="margin-top:0">按盘号登记 CSV 清单</h2>
+  <form method="post" action="/models/{{ model.name }}/disks">
+    <p>
+      盘号：<input type="text" name="disk_no" placeholder="如 DISK-001" required>
+      备注：<input type="text" name="note" placeholder="可选" style="width:260px">
+    </p>
+    <p class="muted">每行一份报文，两列：<span class="mono">测次编号,SHA-256</span>（可带表头，自动识别）。
+      已登记的盘号不能覆盖；复制到新盘后用新盘号补登。同一测次的不同摘要会分别登记、分别核对。</p>
+    <textarea name="csv_text" placeholder="测次编号,摘要&#10;T-001,9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&#10;T-002,e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" required></textarea>
+    <p><button type="submit">登记该盘</button></p>
+  </form>
 </div>
-{% endfor %}
 
-<h2>发布日志（最近 50 条，含拒绝依据）</h2>
-<table>
-  <tr><th>时间</th><th>动作</th><th>结果</th><th>详情</th></tr>
-  {% for l in logs %}
-  <tr>
-    <td class="muted">{{ l.created_at }}</td>
-    <td>{{ "固件" if l.action == "firmware" else "程序" }}{% if l.program_id %}「{{ l.program_id }}」{% endif %}</td>
-    <td>{% if l.result == "published" %}<span style="color:var(--ok)">已发布</span>
-        {% elif l.result == "rejected" %}<span style="color:var(--bad)">已拒绝</span>
-        {% else %}<span class="err">无效</span>{% endif %}</td>
-    <td>{% if l.detail %}<pre>{{ l.detail | tojson }}</pre>{% endif %}</td>
-  </tr>
+<div class="card">
+  <h2 style="margin-top:0">盘片清单与退役办理</h2>
+  {% if disks %}
+  <form method="post" action="/models/{{ model.name }}/retire">
+  <table>
+    <thead>
+      <tr><th>选择退役</th><th>盘号</th><th>状态</th><th>报文份数</th><th>备注</th><th>登记时间</th><th>退役时间</th><th>清单</th></tr>
+    </thead>
+    <tbody>
+    {% for d in disks %}
+      <tr>
+        <td>
+          {% if d.status == 'active' %}
+          <input type="checkbox" name="disk_nos" value="{{ d.disk_no }}">
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td class="mono">{{ d.disk_no }}</td>
+        <td><span class="tag {{ 'tag-active' if d.status == 'active' else 'tag-retired' }}">
+          {{ '在用' if d.status == 'active' else '已退役' }}</span></td>
+        <td>{{ d.entry_count }}</td>
+        <td>{{ d.note }}</td>
+        <td class="mono">{{ d.created_at }}</td>
+        <td class="mono">{{ d.retired_at or '—' }}</td>
+        <td><a class="btn btn-sm" href="/api/models/{{ model.name }}/disks/{{ d.disk_no }}/entries" target="_blank">查看清单</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p style="margin-top:12px">
+    <button type="submit" class="btn-danger">办理所选盘退役</button>
+    <span class="muted">可勾选多块盘一同退役；任一份报文在所选范围之外的在用盘上缺少相同测次与摘要的副本时，整次退役不生效。</span>
+  </p>
+  </form>
   {% else %}
-  <tr><td colspan="4" class="muted">暂无日志。</td></tr>
-  {% endfor %}
-</table>
+  <p class="muted">暂无盘片，请先登记 CSV 清单。</p>
+  {% endif %}
+</div>
 
-<script>
-function fillSnippet(btn) {
-  const target = btn.dataset.target;
-  const doc = JSON.parse(btn.dataset.doc);
-  if (target === 'firmware') {
-    document.getElementById('fw_schema').value = JSON.stringify(doc, null, 2);
-    document.getElementById('fw_schema').scrollIntoView({behavior: 'smooth'});
-  } else {
-    document.getElementById('prog_id').value = btn.dataset.prog || '';
-    document.getElementById('prog_schema').value = JSON.stringify(doc, null, 2);
-    document.getElementById('prog_schema').scrollIntoView({behavior: 'smooth'});
-  }
-}
-</script>
+<div class="card">
+  <h2 style="margin-top:0">退役登记（保留供线下拔盘，重启后可查）</h2>
+  {% if records %}
+  <div class="scroll">
+  <table>
+    <thead><tr><th>时间</th><th>结果</th><th>涉及盘号</th><th>核对条目</th><th>说明</th><th>缺副本明细</th></tr></thead>
+    <tbody>
+    {% for r in records %}
+    {% set miss_list = r.missing | parse_json %}
+      <tr>
+        <td class="mono">{{ r.created_at }}</td>
+        <td><span class="tag {{ 'tag-active' if r.result == 'retired' else 'tag-retired' }}">
+          {{ '已退役' if r.result == 'retired' else '拒绝（未生效）' }}</span></td>
+        <td class="mono">{{ (r.disk_nos | parse_json) | join(', ') }}</td>
+        <td>{{ r.entry_count }}</td>
+        <td>{{ r.detail }}</td>
+        <td>
+          {% if miss_list %}
+          <details>
+            <summary>{{ miss_list | length }} 份待迁移</summary>
+            <table>
+              <thead><tr><th>测次</th><th>摘要</th><th>所在盘</th></tr></thead>
+              <tbody>
+              {% for m in miss_list %}
+                <tr><td class="mono">{{ m.test_no }}</td><td class="mono">{{ m.sha256 }}</td>
+                <td class="mono">{{ m.on_disk | join(', ') }}</td></tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </details>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">暂无退役登记。</p>
+  {% endif %}
+</div>
 {% endblock %}

@@ -1,68 +1,104 @@
-"""持久化层：PostgreSQL（生产，docker-compose）/ SQLite（本地自测，由 DATABASE_URL 切换）。"""
+"""持久化层：SQLite（单文件，Docker 命名卷挂载，重启后数据保留）。
+
+写操作统一走 service 层的串行化事务（全局写锁 + IMMEDIATE 事务 + busy_timeout），
+保证并行退役办理时，最后一份副本始终留在在用盘上。
+"""
 import os
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
-from sqlalchemy import (Column, DateTime, ForeignKey, Integer, String,
-                        UniqueConstraint, create_engine, event, func)
-from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.types import JSON
+DB_PATH = os.environ.get("DB_PATH", "/data/archive.db")
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./contracts.db")
-
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=_connect_args)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
-Base = declarative_base()
-
-# PostgreSQL 上使用 JSONB，其余方言退化为通用 JSON
-from sqlalchemy.dialects.postgresql import JSONB  # noqa: E402
-JsonDoc = JSON().with_variant(JSONB(), "postgresql")
-
-if DATABASE_URL.startswith("sqlite"):
-    @event.listens_for(engine, "connect")
-    def _sqlite_busy_timeout(dbapi_conn, _):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA busy_timeout=30000")
-        cur.close()
+# 进程内写锁：FastAPI 线程池下先在应用层串行化，再由 SQLite 单写者模型兜底
+write_lock = threading.RLock()
 
 
-class DeviceModel(Base):
-    __tablename__ = "device_models"
-    id = Column(Integer, primary_key=True)
-    name = Column(String(64), unique=True, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class FirmwareFormat(Base):
-    """历代固件写入格式：只追加，每型号至多 8 份。"""
-    __tablename__ = "firmware_formats"
-    id = Column(Integer, primary_key=True)
-    model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False, index=True)
-    version = Column(Integer, nullable=False)
-    doc = Column("schema", JsonDoc, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (UniqueConstraint("model_id", "version"),)
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
-class ProgramFormat(Base):
-    """现用程序读取格式：按程序号替换，每型号至多 8 个程序。"""
-    __tablename__ = "program_formats"
-    id = Column(Integer, primary_key=True)
-    model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False, index=True)
-    program_id = Column(String(64), nullable=False)
-    doc = Column("schema", JsonDoc, nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
-                        onupdate=func.now())
-    __table_args__ = (UniqueConstraint("model_id", "program_id"),)
+@contextmanager
+def get_conn():
+    conn = _connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
-class PublishLog(Base):
-    """发布日志：成功/拒绝/无效均留痕，拒绝时保存反例等依据。"""
-    __tablename__ = "publish_log"
-    id = Column(Integer, primary_key=True)
-    model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False, index=True)
-    action = Column(String(16), nullable=False)      # firmware | program
-    program_id = Column(String(64), nullable=True)
-    doc = Column("schema", JsonDoc, nullable=False)
-    result = Column(String(16), nullable=False)      # published | rejected | invalid
-    detail = Column(JsonDoc, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+@contextmanager
+def tx():
+    """写事务：持有进程锁，立即获取 SQLite 写锁（BEGIN IMMEDIATE）。
+
+    多进程（多 worker / 多容器）情况下由 busy_timeout 等待写锁，
+    锁等待冲突抛 OperationalError 时由 service 层重试。
+    """
+    with write_lock:
+        conn = _connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS device_models (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS disks (
+    id         INTEGER PRIMARY KEY,
+    model_id   INTEGER NOT NULL REFERENCES device_models(id),
+    disk_no    TEXT NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('active', 'retired')),
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    retired_at TEXT,
+    UNIQUE (model_id, disk_no)
+);
+
+CREATE TABLE IF NOT EXISTS manifest_entries (
+    id         INTEGER PRIMARY KEY,
+    disk_id    INTEGER NOT NULL REFERENCES disks(id),
+    test_no    TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (disk_id, test_no, sha256)
+);
+
+CREATE TABLE IF NOT EXISTS retirement_records (
+    id          INTEGER PRIMARY KEY,
+    model_id    INTEGER NOT NULL REFERENCES device_models(id),
+    disk_ids    TEXT NOT NULL,           -- JSON 数组，保留退役时的盘号顺序
+    disk_nos    TEXT NOT NULL,           -- JSON 数组（盘号冗余，便于拔盘线下核对）
+    result      TEXT NOT NULL CHECK (result IN ('retired', 'rejected')),
+    missing     TEXT NOT NULL,           -- JSON：缺副本的 [{test_no, sha256, on_disk}]
+    entry_count INTEGER NOT NULL,        -- 本次核对的报文条目数
+    detail      TEXT NOT NULL,           -- 文本说明
+    created_at  TEXT NOT NULL
+);
+"""
+
+
+def init_db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(SCHEMA)

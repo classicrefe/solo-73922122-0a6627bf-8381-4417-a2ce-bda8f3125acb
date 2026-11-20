@@ -1,144 +1,121 @@
-"""契约发布网页：FastAPI 入口（HTML 页面 + JSON API）。"""
+"""水质档案 · 盘片退役管理网页（FastAPI：HTML 页面 + JSON API）。"""
 import json
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from pydantic import BaseModel, Field
 
 import service
-from db import (Base, DeviceModel, FirmwareFormat, ProgramFormat, PublishLog,
-                SessionLocal, engine)
-from examples import EXAMPLES
+from db import get_conn, init_db
+from service import ServiceError
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 templates.env.filters["tojson"] = lambda v, indent=2: json.dumps(
     v, ensure_ascii=False, indent=indent)
-templates.env.filters["tojsonc"] = lambda v: json.dumps(
-    v, ensure_ascii=False, separators=(",", ":"))
-
-
-def _wait_for_db(retries=40, delay=1.0):
-    for i in range(retries):
-        try:
-            with engine.connect():
-                return
-        except OperationalError:
-            if i == retries - 1:
-                raise
-            time.sleep(delay)
+templates.env.filters["parse_json"] = lambda s: json.loads(s)
 
 
 @asynccontextmanager
-async def lifespan(app):
-    _wait_for_db()
-    Base.metadata.create_all(engine)
+async def lifespan(app: FastAPI):
+    init_db()
     yield
 
 
-app = FastAPI(title="水质平台报文契约发布", lifespan=lifespan)
+app = FastAPI(title="水质档案 · 盘片退役管理", lifespan=lifespan)
 
 
-# ---------------- 公共数据 ----------------
-
-def _get_model_or_404(name: str) -> DeviceModel:
-    with SessionLocal() as s:
-        m = s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none()
-        if m is None:
-            raise HTTPException(404, f"型号 {name!r} 不存在")
-        return DeviceModel(id=m.id, name=m.name)
-
-
-def _model_context(name: str, result=None):
-    with SessionLocal() as s:
-        model = s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none()
-        if model is None:
-            raise HTTPException(404, f"型号 {name!r} 不存在")
-        firmwares = s.execute(select(FirmwareFormat)
-                              .where(FirmwareFormat.model_id == model.id)
-                              .order_by(FirmwareFormat.version)).scalars().all()
-        programs = s.execute(select(ProgramFormat)
-                             .where(ProgramFormat.model_id == model.id)
-                             .order_by(ProgramFormat.program_id)).scalars().all()
-        logs = s.execute(select(PublishLog).where(PublishLog.model_id == model.id)
-                         .order_by(PublishLog.id.desc()).limit(50)).scalars().all()
-        s.expunge_all()
-        return {
-            "model": model, "firmwares": firmwares, "programs": programs,
-            "logs": logs, "examples": EXAMPLES, "result": result,
-            "max_formats": service.MAX_FORMATS,
-        }
+@app.exception_handler(ServiceError)
+async def service_error_handler(request: Request, exc: ServiceError):
+    """JSON 接口的业务错误统一为 {"ok": false, "message": ...}。"""
+    return JSONResponse({"ok": False, "message": str(exc)}, status_code=exc.status)
 
 
 # ---------------- HTML 页面 ----------------
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    with SessionLocal() as s:
-        models = s.execute(select(DeviceModel).order_by(DeviceModel.name)).scalars().all()
-        rows = []
-        for m in models:
-            fw = s.execute(select(FirmwareFormat).where(FirmwareFormat.model_id == m.id)).scalars().all()
-            pg = s.execute(select(ProgramFormat).where(ProgramFormat.model_id == m.id)).scalars().all()
-            rows.append({"name": m.name, "fw_count": len(fw), "pg_count": len(pg)})
+    with get_conn() as conn:
+        rows = service.list_models(conn)
     return templates.TemplateResponse(request, "index.html", {"rows": rows})
 
 
 @app.post("/models")
-def create_model(request: Request, name: str = Form(...)):
-    name = (name or "").strip()
-    if not service.valid_name(name):
-        with SessionLocal() as s:
-            models = s.execute(select(DeviceModel).order_by(DeviceModel.name)).scalars().all()
-            rows = [{"name": m.name, "fw_count": 0, "pg_count": 0} for m in models]
+def create_model_html(request: Request, name: str = Form(...)):
+    try:
+        with get_conn() as conn:
+            service.create_model(conn, name)
+            conn.commit()
+    except ServiceError as e:
+        with get_conn() as conn:
+            rows = service.list_models(conn)
         return templates.TemplateResponse(
-            request, "index.html", {"rows": rows,
-                                    "error": "型号名只能由字母数字及 _ . - 组成，长度 1~64"},
-            status_code=400)
-    with SessionLocal() as s:
-        if s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none():
-            return RedirectResponse(f"/models/{name}", status_code=303)
-        s.add(DeviceModel(name=name))
-        s.commit()
-    return RedirectResponse(f"/models/{name}", status_code=303)
+            request, "index.html", {"rows": rows, "error": str(e)}, status_code=e.status)
+    return RedirectResponse(f"/models/{name.strip()}", status_code=303)
 
 
 @app.get("/models/{name}", response_class=HTMLResponse)
-def model_page(request: Request, name: str):
-    return templates.TemplateResponse(request, "model.html", _model_context(name))
+def model_page(request: Request, name: str, notice: str | None = None):
+    with get_conn() as conn:
+        ctx = service.model_detail(conn, name)
+    parsed_notice = json.loads(notice) if notice else None
+    return templates.TemplateResponse(
+        request, "model.html", {**ctx, "notice": parsed_notice})
 
 
-@app.post("/models/{name}/firmware", response_class=HTMLResponse)
-def fw_publish_html(request: Request, name: str, schema_text: str = Form(...)):
-    model = _get_model_or_404(name)
+@app.post("/models/{name}/disks", response_class=HTMLResponse)
+def register_disk_html(request: Request, name: str,
+                       disk_no: str = Form(...),
+                       csv_text: str = Form(...),
+                       note: str = Form("")):
     try:
-        doc = json.loads(schema_text)
-    except json.JSONDecodeError as e:
-        outcome = service.PublishOutcome(False, f"JSON 解析失败：{e}")
-    else:
-        outcome = service.publish_firmware(model.id, doc)
-    return templates.TemplateResponse(request, "model.html",
-                                      _model_context(name, result=outcome))
+        result = service.register_disk(name, disk_no, csv_text, note)
+    except ServiceError as e:
+        with get_conn() as conn:
+            ctx = service.model_detail(conn, name)
+        return templates.TemplateResponse(
+            request, "model.html",
+            {**ctx, "notice": {"ok": False, "message": str(e)}},
+            status_code=e.status)
+    dup = len(result["duplicates"])
+    msg = (f"盘 {result['disk_no']} 登记成功，共 {result['entry_count']} 份报文"
+           + (f"（自动去重 {dup} 行重复）" if dup else ""))
+    return RedirectResponse(
+        f"/models/{name}?notice=" + _notice_param(True, msg), status_code=303)
 
 
-@app.post("/models/{name}/programs", response_class=HTMLResponse)
-def prog_publish_html(request: Request, name: str,
-                      program_id: str = Form(...), schema_text: str = Form(...)):
-    model = _get_model_or_404(name)
+@app.post("/models/{name}/retire", response_class=HTMLResponse)
+def retire_html(request: Request, name: str, disk_nos: list[str] = Form(default=[])):
     try:
-        doc = json.loads(schema_text)
-    except json.JSONDecodeError as e:
-        outcome = service.PublishOutcome(False, f"JSON 解析失败：{e}")
+        result = service.retire_disks(name, disk_nos)
+    except ServiceError as e:
+        with get_conn() as conn:
+            ctx = service.model_detail(conn, name)
+        return templates.TemplateResponse(
+            request, "model.html",
+            {**ctx, "notice": {"ok": False, "message": str(e)}},
+            status_code=e.status)
+    if result["ok"]:
+        msg = (f"退役成功：{', '.join(result['disk_nos'])}（"
+               f"{result['entry_count']} 份报文均有范围外在用盘副本），可线下拔盘")
     else:
-        outcome = service.publish_program(model.id, program_id.strip(), doc)
-    return templates.TemplateResponse(request, "model.html",
-                                      _model_context(name, result=outcome))
+        msg = (f"退役未生效：{len(result['missing'])} 份报文在范围外在用盘上找不到"
+               "相同测次与摘要的副本，详见下方待迁移清单")
+    return RedirectResponse(
+        f"/models/{name}?notice=" + _notice_param(result["ok"], msg, result),
+        status_code=303)
+
+
+def _notice_param(ok: bool, message: str, result: dict | None = None) -> str:
+    payload = {"ok": ok, "message": message}
+    if result and not result["ok"]:
+        payload["missing"] = result["missing"]
+        payload["disk_nos"] = result["disk_nos"]
+    return quote(json.dumps(payload, ensure_ascii=False))
 
 
 # ---------------- JSON API ----------------
@@ -147,25 +124,14 @@ class ModelIn(BaseModel):
     name: str
 
 
-class FirmwareIn(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    doc: dict = Field(alias="schema")
+class DiskIn(BaseModel):
+    disk_no: str
+    csv_text: str = Field(alias="csv")
+    note: str = ""
 
 
-class ProgramIn(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    program_id: str
-    doc: dict = Field(alias="schema")
-
-
-def _outcome_response(outcome: service.PublishOutcome, extra=None):
-    body = {"ok": outcome.ok, "message": outcome.message}
-    if outcome.problems:
-        body["problems"] = outcome.problems
-    if extra:
-        body.update(extra)
-    status = 200 if outcome.ok else (409 if outcome.problems else 422)
-    return JSONResponse(body, status_code=status)
+class RetireIn(BaseModel):
+    disk_nos: list[str]
 
 
 @app.get("/api/health")
@@ -175,50 +141,64 @@ def health():
 
 @app.post("/api/models", status_code=201)
 def api_create_model(body: ModelIn):
-    name = body.name.strip()
-    if not service.valid_name(name):
-        raise HTTPException(422, "型号名只能由字母数字及 _ . - 组成，长度 1~64")
-    with SessionLocal() as s:
-        if s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none():
-            raise HTTPException(409, f"型号 {name!r} 已存在")
-        s.add(DeviceModel(name=name))
-        try:
-            s.commit()
-        except IntegrityError:
-            s.rollback()
-            raise HTTPException(409, f"型号 {name!r} 已存在")
-    return {"ok": True, "name": name}
+    with get_conn() as conn:
+        model_id = service.create_model(conn, body.name)
+        conn.commit()
+    return {"ok": True, "name": body.name.strip(), "id": model_id}
 
 
 @app.get("/api/models/{name}")
-def api_model_state(name: str):
-    ctx = _model_context(name)
+def api_model(name: str):
+    with get_conn() as conn:
+        ctx = service.model_detail(conn, name)
     return {
-        "name": ctx["model"].name,
-        "firmwares": [{"version": f.version, "schema": f.doc,
-                       "created_at": str(f.created_at)} for f in ctx["firmwares"]],
-        "programs": [{"program_id": p.program_id, "schema": p.doc,
-                      "updated_at": str(p.updated_at)} for p in ctx["programs"]],
+        "name": ctx["model"]["name"],
+        "disks": [{"disk_no": d["disk_no"], "status": d["status"],
+                   "entry_count": d["entry_count"], "note": d["note"],
+                   "created_at": d["created_at"], "retired_at": d["retired_at"]}
+                  for d in ctx["disks"]],
     }
 
 
-@app.get("/api/models/{name}/log")
-def api_model_log(name: str):
-    ctx = _model_context(name)
-    return {"logs": [{"action": l.action, "program_id": l.program_id,
-                      "result": l.result, "detail": l.detail,
-                      "created_at": str(l.created_at)} for l in ctx["logs"]]}
+@app.get("/api/models/{name}/disks/{disk_no}/entries")
+def api_disk_entries(name: str, disk_no: str):
+    with get_conn() as conn:
+        model = service.get_model(conn, name)
+        disk = conn.execute(
+            "SELECT * FROM disks WHERE model_id=? AND disk_no=?",
+            (model["id"], disk_no)).fetchone()
+        if disk is None:
+            raise ServiceError(f"盘号 {disk_no!r} 不存在", status=404)
+        entries = conn.execute(
+            "SELECT test_no, sha256 FROM manifest_entries WHERE disk_id=? "
+            "ORDER BY test_no, sha256", (disk["id"],)).fetchall()
+    return {"disk_no": disk_no, "status": disk["status"],
+            "entries": [{"test_no": r["test_no"], "sha256": r["sha256"]} for r in entries]}
 
 
-@app.post("/api/models/{name}/firmware")
-def api_publish_firmware(name: str, body: FirmwareIn):
-    model = _get_model_or_404(name)
-    outcome = service.publish_firmware(model.id, body.doc)
-    return _outcome_response(outcome, {"version": outcome.version})
+@app.post("/api/models/{name}/disks", status_code=201)
+def api_register(name: str, body: DiskIn):
+    result = service.register_disk(name, body.disk_no, body.csv_text, body.note)
+    return {"ok": True, **result}
 
 
-@app.post("/api/models/{name}/programs")
-def api_publish_program(name: str, body: ProgramIn):
-    model = _get_model_or_404(name)
-    outcome = service.publish_program(model.id, body.program_id.strip(), body.doc)
-    return _outcome_response(outcome)
+@app.post("/api/models/{name}/retire")
+def api_retire(name: str, body: RetireIn):
+    result = service.retire_disks(name, body.disk_nos)
+    status = 200 if result["ok"] else 409
+    return JSONResponse({"ok": result["ok"], **result}, status_code=status)
+
+
+@app.get("/api/models/{name}/retirements")
+def api_retirements(name: str):
+    with get_conn() as conn:
+        ctx = service.model_detail(conn, name)
+    out = []
+    for r in ctx["records"]:
+        out.append({"disk_nos": json.loads(r["disk_nos"]),
+                    "result": r["result"],
+                    "missing": json.loads(r["missing"]),
+                    "entry_count": r["entry_count"],
+                    "detail": r["detail"],
+                    "created_at": r["created_at"]})
+    return {"retirements": out}
